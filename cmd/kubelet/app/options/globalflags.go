@@ -25,7 +25,7 @@ import (
 	"github.com/spf13/pflag"
 
 	// libs that provide registration functions
-	"k8s.io/apiserver/pkg/util/logs"
+	"k8s.io/component-base/logs"
 	"k8s.io/kubernetes/pkg/version/verflag"
 
 	// ensure libs have a chance to globally register their flags
@@ -104,6 +104,7 @@ func addGlogFlags(fs *pflag.FlagSet) {
 	register(global, local, "vmodule")
 	register(global, local, "log_backtrace_at")
 	register(global, local, "log_dir")
+	register(global, local, "log_file")
 
 	fs.AddFlagSet(local)
 }

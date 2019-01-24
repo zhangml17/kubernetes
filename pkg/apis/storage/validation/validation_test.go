@@ -22,7 +22,6 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/storage"
 )
@@ -136,40 +135,6 @@ func TestValidateStorageClass(t *testing.T) {
 			t.Errorf("Expected failure for test: %s", testName)
 		}
 	}
-}
-
-func TestAlphaExpandPersistentVolumesFeatureValidation(t *testing.T) {
-	deleteReclaimPolicy := api.PersistentVolumeReclaimPolicy("Delete")
-	falseVar := false
-	testSC := &storage.StorageClass{
-		// empty parameters
-		ObjectMeta:           metav1.ObjectMeta{Name: "foo"},
-		Provisioner:          "kubernetes.io/foo-provisioner",
-		Parameters:           map[string]string{},
-		ReclaimPolicy:        &deleteReclaimPolicy,
-		AllowVolumeExpansion: &falseVar,
-		VolumeBindingMode:    &immediateMode1,
-	}
-
-	// Enable alpha feature ExpandPersistentVolumes
-	err := utilfeature.DefaultFeatureGate.Set("ExpandPersistentVolumes=true")
-	if err != nil {
-		t.Errorf("Failed to enable feature gate for ExpandPersistentVolumes: %v", err)
-		return
-	}
-	if errs := ValidateStorageClass(testSC); len(errs) != 0 {
-		t.Errorf("expected success: %v", errs)
-	}
-	// Disable alpha feature ExpandPersistentVolumes
-	err = utilfeature.DefaultFeatureGate.Set("ExpandPersistentVolumes=false")
-	if err != nil {
-		t.Errorf("Failed to disable feature gate for ExpandPersistentVolumes: %v", err)
-		return
-	}
-	if errs := ValidateStorageClass(testSC); len(errs) == 0 {
-		t.Errorf("expected failure, but got no error")
-	}
-
 }
 
 func TestVolumeAttachmentValidation(t *testing.T) {
@@ -512,25 +477,6 @@ func makeClass(mode *storage.VolumeBindingMode, topologies []api.TopologySelecto
 	}
 }
 
-// TODO: Remove these tests once feature gate is not required
-func TestValidateVolumeBindingModeAlphaDisabled(t *testing.T) {
-	errorCases := map[string]*storage.StorageClass{
-		"immediate mode": makeClass(&immediateMode1, nil),
-		"waiting mode":   makeClass(&waitingMode, nil),
-		"invalid mode":   makeClass(&invalidMode, nil),
-	}
-
-	err := utilfeature.DefaultFeatureGate.Set("VolumeScheduling=false")
-	if err != nil {
-		t.Fatalf("Failed to enable feature gate for VolumeScheduling: %v", err)
-	}
-	for testName, storageClass := range errorCases {
-		if errs := ValidateStorageClass(storageClass); len(errs) == 0 {
-			t.Errorf("Expected failure for test: %v", testName)
-		}
-	}
-}
-
 type bindingTest struct {
 	class         *storage.StorageClass
 	shouldSucceed bool
@@ -556,12 +502,6 @@ func TestValidateVolumeBindingMode(t *testing.T) {
 		},
 	}
 
-	// TODO: remove when feature gate not required
-	err := utilfeature.DefaultFeatureGate.Set("VolumeScheduling=true")
-	if err != nil {
-		t.Fatalf("Failed to enable feature gate for VolumeScheduling: %v", err)
-	}
-
 	for testName, testCase := range cases {
 		errs := ValidateStorageClass(testCase.class)
 		if testCase.shouldSucceed && len(errs) != 0 {
@@ -570,11 +510,6 @@ func TestValidateVolumeBindingMode(t *testing.T) {
 		if !testCase.shouldSucceed && len(errs) == 0 {
 			t.Errorf("Expected failure for test %q, got success", testName)
 		}
-	}
-
-	err = utilfeature.DefaultFeatureGate.Set("VolumeScheduling=false")
-	if err != nil {
-		t.Fatalf("Failed to disable feature gate for VolumeScheduling: %v", err)
 	}
 }
 
@@ -623,12 +558,6 @@ func TestValidateUpdateVolumeBindingMode(t *testing.T) {
 		},
 	}
 
-	// TODO: remove when feature gate not required
-	err := utilfeature.DefaultFeatureGate.Set("VolumeScheduling=true")
-	if err != nil {
-		t.Fatalf("Failed to enable feature gate for VolumeScheduling: %v", err)
-	}
-
 	for testName, testCase := range cases {
 		errs := ValidateStorageClassUpdate(testCase.newClass, testCase.oldClass)
 		if testCase.shouldSucceed && len(errs) != 0 {
@@ -637,11 +566,6 @@ func TestValidateUpdateVolumeBindingMode(t *testing.T) {
 		if !testCase.shouldSucceed && len(errs) == 0 {
 			t.Errorf("Expected failure for %v, got success", testName)
 		}
-	}
-
-	err = utilfeature.DefaultFeatureGate.Set("VolumeScheduling=false")
-	if err != nil {
-		t.Fatalf("Failed to disable feature gate for VolumeScheduling: %v", err)
 	}
 }
 
@@ -936,30 +860,12 @@ func TestValidateAllowedTopologies(t *testing.T) {
 		},
 	}
 
-	// TODO: remove when feature gate not required
-	err := utilfeature.DefaultFeatureGate.Set("VolumeScheduling=true")
-	if err != nil {
-		t.Fatalf("Failed to enable feature gate for VolumeScheduling: %v", err)
-	}
-
 	for testName, testCase := range cases {
 		errs := ValidateStorageClass(testCase.class)
 		if testCase.shouldSucceed && len(errs) != 0 {
 			t.Errorf("Expected success for test %q, got %v", testName, errs)
 		}
 		if !testCase.shouldSucceed && len(errs) == 0 {
-			t.Errorf("Expected failure for test %q, got success", testName)
-		}
-	}
-
-	err = utilfeature.DefaultFeatureGate.Set("VolumeScheduling=false")
-	if err != nil {
-		t.Fatalf("Failed to disable feature gate for VolumeScheduling: %v", err)
-	}
-
-	for testName, testCase := range cases {
-		errs := ValidateStorageClass(testCase.class)
-		if len(errs) == 0 && testCase.class.AllowedTopologies != nil {
 			t.Errorf("Expected failure for test %q, got success", testName)
 		}
 	}

@@ -50,6 +50,7 @@ func NewMarkControlPlanePhase() workflow.Phase {
 		Example: markControlPlaneExample,
 		InheritFlags: []string{
 			options.NodeName,
+			options.CfgPath,
 		},
 		Run: runMarkControlPlane,
 	}
@@ -68,9 +69,5 @@ func runMarkControlPlane(c workflow.RunData) error {
 	}
 
 	nodeRegistration := data.Cfg().NodeRegistration
-	if err := markcontrolplanephase.MarkControlPlane(client, nodeRegistration.Name, nodeRegistration.Taints); err != nil {
-		return err
-	}
-
-	return nil
+	return markcontrolplanephase.MarkControlPlane(client, nodeRegistration.Name, nodeRegistration.Taints)
 }

@@ -33,7 +33,6 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	kstrings "k8s.io/kubernetes/pkg/util/strings"
 	"k8s.io/kubernetes/pkg/volume"
-	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 //TODO (vladimirvivien) move this in a central loc later
@@ -55,18 +54,18 @@ var (
 )
 
 type csiMountMgr struct {
-	csiClient    csiClient
-	k8s          kubernetes.Interface
-	plugin       *csiPlugin
-	driverName   string
-	volumeID     string
-	specVolumeID string
-	readOnly     bool
-	spec         *volume.Spec
-	pod          *api.Pod
-	podUID       types.UID
-	options      volume.VolumeOptions
-	volumeInfo   map[string]string
+	csiClient      csiClient
+	k8s            kubernetes.Interface
+	plugin         *csiPlugin
+	driverName     csiDriverName
+	volumeID       string
+	specVolumeID   string
+	readOnly       bool
+	spec           *volume.Spec
+	pod            *api.Pod
+	podUID         types.UID
+	options        volume.VolumeOptions
+	publishContext map[string]string
 	volume.MetricsNil
 }
 
@@ -121,7 +120,7 @@ func (c *csiMountMgr) SetUpAt(dir string, fsGroup *int64) error {
 
 	// Check for STAGE_UNSTAGE_VOLUME set and populate deviceMountPath if so
 	deviceMountPath := ""
-	stageUnstageSet, err := hasStageUnstageCapability(ctx, csi)
+	stageUnstageSet, err := csi.NodeSupportsStageUnstage(ctx)
 	if err != nil {
 		klog.Error(log("mounter.SetUpAt failed to check for STAGE_UNSTAGE_VOLUME capabilty: %v", err))
 		return err
@@ -135,9 +134,9 @@ func (c *csiMountMgr) SetUpAt(dir string, fsGroup *int64) error {
 		}
 	}
 	// search for attachment by VolumeAttachment.Spec.Source.PersistentVolumeName
-	if c.volumeInfo == nil {
+	if c.publishContext == nil {
 		nodeName := string(c.plugin.host.GetNodeName())
-		c.volumeInfo, err = c.plugin.getPublishVolumeInfo(c.k8s, c.volumeID, c.driverName, nodeName)
+		c.publishContext, err = c.plugin.getPublishContext(c.k8s, c.volumeID, string(c.driverName), nodeName)
 		if err != nil {
 			return err
 		}
@@ -191,7 +190,7 @@ func (c *csiMountMgr) SetUpAt(dir string, fsGroup *int64) error {
 		deviceMountPath,
 		dir,
 		accessMode,
-		c.volumeInfo,
+		c.publishContext,
 		attribs,
 		nodePublishSecrets,
 		fsType,
@@ -239,7 +238,7 @@ func (c *csiMountMgr) podAttributes() (map[string]string, error) {
 		return nil, errors.New("CSIDriver lister does not exist")
 	}
 
-	csiDriver, err := c.plugin.csiDriverLister.Get(c.driverName)
+	csiDriver, err := c.plugin.csiDriverLister.Get(string(c.driverName))
 	if err != nil {
 		if apierrs.IsNotFound(err) {
 			klog.V(4).Infof(log("CSIDriver %q not found, not adding pod information", c.driverName))
@@ -289,20 +288,6 @@ func (c *csiMountMgr) TearDown() error {
 func (c *csiMountMgr) TearDownAt(dir string) error {
 	klog.V(4).Infof(log("Unmounter.TearDown(%s)", dir))
 
-	// is dir even mounted ?
-	// TODO (vladimirvivien) this check may not work for an emptyDir or local storage
-	// see https://github.com/kubernetes/kubernetes/pull/56836#discussion_r155834524
-	mounted, err := isDirMounted(c.plugin, dir)
-	if err != nil {
-		klog.Error(log("unmounter.Teardown failed while checking mount status for dir [%s]: %v", dir, err))
-		return err
-	}
-
-	if !mounted {
-		klog.V(4).Info(log("unmounter.Teardown skipping unmount, dir not mounted [%s]", dir))
-		return nil
-	}
-
 	volID := c.volumeID
 	csi := c.csiClient
 
@@ -319,7 +304,7 @@ func (c *csiMountMgr) TearDownAt(dir string) error {
 		klog.Error(log("mounter.TearDownAt failed to clean mount dir [%s]: %v", dir, err))
 		return err
 	}
-	klog.V(4).Infof(log("mounte.TearDownAt successfully unmounted dir [%s]", dir))
+	klog.V(4).Infof(log("mounter.TearDownAt successfully unmounted dir [%s]", dir))
 
 	return nil
 }
@@ -375,21 +360,12 @@ func isDirMounted(plug *csiPlugin, dir string) (bool, error) {
 // removeMountDir cleans the mount dir when dir is not mounted and removed the volume data file in dir
 func removeMountDir(plug *csiPlugin, mountPath string) error {
 	klog.V(4).Info(log("removing mount path [%s]", mountPath))
-	if pathExists, pathErr := util.PathExists(mountPath); pathErr != nil {
-		klog.Error(log("failed while checking mount path stat [%s]", pathErr))
-		return pathErr
-	} else if !pathExists {
-		klog.Warning(log("skipping mount dir removal, path does not exist [%v]", mountPath))
-		return nil
-	}
 
-	mounter := plug.host.GetMounter(plug.GetPluginName())
-	notMnt, err := mounter.IsLikelyNotMountPoint(mountPath)
+	mnt, err := isDirMounted(plug, mountPath)
 	if err != nil {
-		klog.Error(log("mount dir removal failed [%s]: %v", mountPath, err))
 		return err
 	}
-	if notMnt {
+	if !mnt {
 		klog.V(4).Info(log("dir not mounted, deleting it [%s]", mountPath))
 		if err := os.Remove(mountPath); err != nil && !os.IsNotExist(err) {
 			klog.Error(log("failed to remove dir [%s]: %v", mountPath, err))

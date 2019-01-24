@@ -33,12 +33,12 @@ import (
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 
+	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud"
+	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/gce/cloud/meta"
 	"k8s.io/kubernetes/pkg/features"
 )
 
@@ -158,7 +158,7 @@ func (manager *gceServiceManager) CreateRegionalDiskOnCloudProvider(
 	fullyQualifiedReplicaZones := []string{}
 	for _, replicaZone := range replicaZones.UnsortedList() {
 		fullyQualifiedReplicaZones = append(
-			fullyQualifiedReplicaZones, manager.getReplicaZoneURI(replicaZone, true))
+			fullyQualifiedReplicaZones, manager.getReplicaZoneURI(replicaZone))
 	}
 
 	diskToCreate := &compute.Disk{
@@ -359,15 +359,8 @@ func (manager *gceServiceManager) getDiskTypeURI(
 	}
 }
 
-func (manager *gceServiceManager) getReplicaZoneURI(zone string, useBetaAPI bool) string {
-	var getProjectsAPIEndpoint string
-	if useBetaAPI {
-		getProjectsAPIEndpoint = manager.getProjectsAPIEndpointBeta()
-	} else {
-		getProjectsAPIEndpoint = manager.getProjectsAPIEndpoint()
-	}
-
-	return getProjectsAPIEndpoint + fmt.Sprintf(
+func (manager *gceServiceManager) getReplicaZoneURI(zone string) string {
+	return manager.getProjectsAPIEndpoint() + fmt.Sprintf(
 		replicaZoneURITemplateSingleZone,
 		manager.gce.projectID,
 		zone)

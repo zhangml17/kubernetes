@@ -29,15 +29,18 @@ import (
 
 	"k8s.io/klog"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -48,6 +51,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/pkg/features"
 	vol "k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util/recyclerclient"
 )
@@ -134,6 +138,7 @@ type volumeReactor struct {
 	fakeClaimWatch       *watch.FakeWatcher
 	lock                 sync.Mutex
 	errors               []reactorError
+	watchers             map[schema.GroupVersionResource]map[string][]*watch.RaceFreeFakeWatcher
 }
 
 // reactorError is an error that is returned by test reactor (=simulated
@@ -179,12 +184,41 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 			return true, nil, fmt.Errorf("Cannot create volume %s: volume already exists", volume.Name)
 		}
 
+		// mimic apiserver defaulting
+		if volume.Spec.VolumeMode == nil && utilfeature.DefaultFeatureGate.Enabled(features.BlockVolume) {
+			volume.Spec.VolumeMode = new(v1.PersistentVolumeMode)
+			*volume.Spec.VolumeMode = v1.PersistentVolumeFilesystem
+		}
+
 		// Store the updated object to appropriate places.
 		r.volumes[volume.Name] = volume
+		for _, w := range r.getWatches(action.GetResource(), action.GetNamespace()) {
+			w.Add(volume)
+		}
 		r.changedObjects = append(r.changedObjects, volume)
 		r.changedSinceLastSync++
 		klog.V(4).Infof("created volume %s", volume.Name)
 		return true, volume, nil
+
+	case action.Matches("create", "persistentvolumeclaims"):
+		obj := action.(core.UpdateAction).GetObject()
+		claim := obj.(*v1.PersistentVolumeClaim)
+
+		// check the claim does not exist
+		_, found := r.claims[claim.Name]
+		if found {
+			return true, nil, fmt.Errorf("Cannot create claim %s: claim already exists", claim.Name)
+		}
+
+		// Store the updated object to appropriate places.
+		r.claims[claim.Name] = claim
+		for _, w := range r.getWatches(action.GetResource(), action.GetNamespace()) {
+			w.Add(claim)
+		}
+		r.changedObjects = append(r.changedObjects, claim)
+		r.changedSinceLastSync++
+		klog.V(4).Infof("created claim %s", claim.Name)
+		return true, claim, nil
 
 	case action.Matches("update", "persistentvolumes"):
 		obj := action.(core.UpdateAction).GetObject()
@@ -198,6 +232,10 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 			if storedVer != requestedVer {
 				return true, obj, versionConflictError
 			}
+			if reflect.DeepEqual(storedVolume, volume) {
+				klog.V(4).Infof("nothing updated volume %s", volume.Name)
+				return true, volume, nil
+			}
 			// Don't modify the existing object
 			volume = volume.DeepCopy()
 			volume.ResourceVersion = strconv.Itoa(storedVer + 1)
@@ -206,6 +244,9 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 		}
 
 		// Store the updated object to appropriate places.
+		for _, w := range r.getWatches(action.GetResource(), action.GetNamespace()) {
+			w.Modify(volume)
+		}
 		r.volumes[volume.Name] = volume
 		r.changedObjects = append(r.changedObjects, volume)
 		r.changedSinceLastSync++
@@ -224,6 +265,10 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 			if storedVer != requestedVer {
 				return true, obj, versionConflictError
 			}
+			if reflect.DeepEqual(storedClaim, claim) {
+				klog.V(4).Infof("nothing updated claim %s", claim.Name)
+				return true, claim, nil
+			}
 			// Don't modify the existing object
 			claim = claim.DeepCopy()
 			claim.ResourceVersion = strconv.Itoa(storedVer + 1)
@@ -232,6 +277,9 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 		}
 
 		// Store the updated object to appropriate places.
+		for _, w := range r.getWatches(action.GetResource(), action.GetNamespace()) {
+			w.Modify(claim)
+		}
 		r.claims[claim.Name] = claim
 		r.changedObjects = append(r.changedObjects, claim)
 		r.changedSinceLastSync++
@@ -243,18 +291,32 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 		volume, found := r.volumes[name]
 		if found {
 			klog.V(4).Infof("GetVolume: found %s", volume.Name)
-			return true, volume, nil
+			return true, volume.DeepCopy(), nil
 		} else {
 			klog.V(4).Infof("GetVolume: volume %s not found", name)
 			return true, nil, fmt.Errorf("Cannot find volume %s", name)
 		}
 
+	case action.Matches("get", "persistentvolumeclaims"):
+		name := action.(core.GetAction).GetName()
+		claim, found := r.claims[name]
+		if found {
+			klog.V(4).Infof("GetClaim: found %s", claim.Name)
+			return true, claim.DeepCopy(), nil
+		} else {
+			klog.V(4).Infof("GetClaim: claim %s not found", name)
+			return true, nil, apierrs.NewNotFound(action.GetResource().GroupResource(), name)
+		}
+
 	case action.Matches("delete", "persistentvolumes"):
 		name := action.(core.DeleteAction).GetName()
 		klog.V(4).Infof("deleted volume %s", name)
-		_, found := r.volumes[name]
+		obj, found := r.volumes[name]
 		if found {
 			delete(r.volumes, name)
+			for _, w := range r.getWatches(action.GetResource(), action.GetNamespace()) {
+				w.Delete(obj)
+			}
 			r.changedSinceLastSync++
 			return true, nil, nil
 		} else {
@@ -264,9 +326,12 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 	case action.Matches("delete", "persistentvolumeclaims"):
 		name := action.(core.DeleteAction).GetName()
 		klog.V(4).Infof("deleted claim %s", name)
-		_, found := r.volumes[name]
+		obj, found := r.claims[name]
 		if found {
 			delete(r.claims, name)
+			for _, w := range r.getWatches(action.GetResource(), action.GetNamespace()) {
+				w.Delete(obj)
+			}
 			r.changedSinceLastSync++
 			return true, nil, nil
 		} else {
@@ -275,6 +340,36 @@ func (r *volumeReactor) React(action core.Action) (handled bool, ret runtime.Obj
 	}
 
 	return false, nil, nil
+}
+
+// Watch watches objects from the volumeReactor. Watch returns a channel which
+// will push added / modified / deleted object.
+func (r *volumeReactor) Watch(gvr schema.GroupVersionResource, ns string) (watch.Interface, error) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	fakewatcher := watch.NewRaceFreeFake()
+
+	if _, exists := r.watchers[gvr]; !exists {
+		r.watchers[gvr] = make(map[string][]*watch.RaceFreeFakeWatcher)
+	}
+	r.watchers[gvr][ns] = append(r.watchers[gvr][ns], fakewatcher)
+	return fakewatcher, nil
+}
+
+func (r *volumeReactor) getWatches(gvr schema.GroupVersionResource, ns string) []*watch.RaceFreeFakeWatcher {
+	watches := []*watch.RaceFreeFakeWatcher{}
+	if r.watchers[gvr] != nil {
+		if w := r.watchers[gvr][ns]; w != nil {
+			watches = append(watches, w...)
+		}
+		if ns != metav1.NamespaceAll {
+			if w := r.watchers[gvr][metav1.NamespaceAll]; w != nil {
+				watches = append(watches, w...)
+			}
+		}
+	}
+	return watches
 }
 
 // injectReactError returns an error when the test requested given action to
@@ -588,11 +683,14 @@ func newVolumeReactor(client *fake.Clientset, ctrl *PersistentVolumeController, 
 		fakeVolumeWatch: fakeVolumeWatch,
 		fakeClaimWatch:  fakeClaimWatch,
 		errors:          errors,
+		watchers:        make(map[schema.GroupVersionResource]map[string][]*watch.RaceFreeFakeWatcher),
 	}
 	client.AddReactor("create", "persistentvolumes", reactor.React)
+	client.AddReactor("create", "persistentvolumeclaims", reactor.React)
 	client.AddReactor("update", "persistentvolumes", reactor.React)
 	client.AddReactor("update", "persistentvolumeclaims", reactor.React)
 	client.AddReactor("get", "persistentvolumes", reactor.React)
+	client.AddReactor("get", "persistentvolumeclaims", reactor.React)
 	client.AddReactor("delete", "persistentvolumes", reactor.React)
 	client.AddReactor("delete", "persistentvolumeclaims", reactor.React)
 
@@ -630,6 +728,7 @@ func newTestController(kubeClient clientset.Interface, informerFactory informers
 
 // newVolume returns a new volume with given attributes
 func newVolume(name, capacity, boundToClaimUID, boundToClaimName string, phase v1.PersistentVolumePhase, reclaimPolicy v1.PersistentVolumeReclaimPolicy, class string, annotations ...string) *v1.PersistentVolume {
+	fs := v1.PersistentVolumeFilesystem
 	volume := v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -645,6 +744,7 @@ func newVolume(name, capacity, boundToClaimUID, boundToClaimName string, phase v
 			AccessModes:                   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce, v1.ReadOnlyMany},
 			PersistentVolumeReclaimPolicy: reclaimPolicy,
 			StorageClassName:              class,
+			VolumeMode:                    &fs,
 		},
 		Status: v1.PersistentVolumeStatus{
 			Phase: phase,
@@ -740,6 +840,7 @@ func newVolumeArray(name, capacity, boundToClaimUID, boundToClaimName string, ph
 
 // newClaim returns a new claim with given attributes
 func newClaim(name, claimUID, capacity, boundToVolume string, phase v1.PersistentVolumeClaimPhase, class *string, annotations ...string) *v1.PersistentVolumeClaim {
+	fs := v1.PersistentVolumeFilesystem
 	claim := v1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -756,6 +857,7 @@ func newClaim(name, claimUID, capacity, boundToVolume string, phase v1.Persisten
 			},
 			VolumeName:       boundToVolume,
 			StorageClassName: class,
+			VolumeMode:       &fs,
 		},
 		Status: v1.PersistentVolumeClaimStatus{
 			Phase: phase,
@@ -1156,6 +1258,10 @@ func (plugin *mockVolumePlugin) CanSupport(spec *vol.Spec) bool {
 	return true
 }
 
+func (plugin *mockVolumePlugin) IsMigratedToCSI() bool {
+	return false
+}
+
 func (plugin *mockVolumePlugin) RequiresRemount() bool {
 	return false
 }
@@ -1226,6 +1332,7 @@ func (plugin *mockVolumePlugin) Provision(selectedNode *v1.Node, allowedTopologi
 				Phase: v1.VolumeAvailable,
 			},
 		}
+		pv.Spec.VolumeMode = plugin.provisionOptions.PVC.Spec.VolumeMode
 	}
 
 	plugin.provisionCallCounter++

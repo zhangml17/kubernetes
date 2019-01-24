@@ -28,6 +28,7 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/config/strict"
 )
 
 // SetJoinDynamicDefaults checks and sets configuration values for the JoinConfiguration object
@@ -40,11 +41,7 @@ func SetJoinDynamicDefaults(cfg *kubeadmapi.JoinConfiguration) error {
 		return err
 	}
 
-	if err := SetJoinControlPlaneDefaults(cfg.ControlPlane); err != nil {
-		return err
-	}
-
-	return nil
+	return SetJoinControlPlaneDefaults(cfg.ControlPlane)
 }
 
 // SetJoinControlPlaneDefaults checks and sets configuration values for the JoinControlPlane object
@@ -88,6 +85,8 @@ func JoinConfigFileAndDefaultsToInternalConfig(cfgPath string, defaultversionedc
 		for gvk, bytes := range gvkmap {
 			if gvk.Kind == constants.JoinConfigurationKind {
 				joinBytes = bytes
+				// verify the validity of the YAML
+				strict.VerifyUnmarshalStrict(bytes, gvk)
 			}
 		}
 

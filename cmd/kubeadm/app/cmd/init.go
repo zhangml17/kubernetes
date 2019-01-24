@@ -124,13 +124,17 @@ type initData struct {
 }
 
 // NewCmdInit returns "kubeadm init" command.
-func NewCmdInit(out io.Writer) *cobra.Command {
-	initOptions := newInitOptions()
+// NB. initOptions is exposed as parameter for allowing unit testing of
+//     the newInitOptions method, that implements all the command options validation logic
+func NewCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
+	if initOptions == nil {
+		initOptions = newInitOptions()
+	}
 	initRunner := workflow.NewRunner()
 
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Run this command in order to set up the Kubernetes master.",
+		Short: "Run this command in order to set up the Kubernetes control plane.",
 		Run: func(cmd *cobra.Command, args []string) {
 			c, err := initRunner.InitData()
 			kubeadmutil.CheckErr(err)
@@ -152,11 +156,11 @@ func NewCmdInit(out io.Writer) *cobra.Command {
 	AddInitOtherFlags(cmd.Flags(), &initOptions.cfgPath, &initOptions.skipTokenPrint, &initOptions.dryRun, &initOptions.ignorePreflightErrors)
 	initOptions.bto.AddTokenFlag(cmd.Flags())
 	initOptions.bto.AddTTLFlag(cmd.Flags())
+	options.AddImageMetaFlags(cmd.Flags(), &initOptions.externalcfg.ImageRepository)
 
 	// defines additional flag that are not used by the init command but that could be eventually used
 	// by the sub-commands automatically generated for phases
 	initRunner.SetAdditionalFlags(func(flags *flag.FlagSet) {
-		options.AddImageMetaFlags(flags, &initOptions.externalcfg.ImageRepository)
 		options.AddKubeConfigFlag(flags, &initOptions.kubeconfigPath)
 		options.AddKubeConfigDirFlag(flags, &initOptions.kubeconfigDir)
 		options.AddControlPlanExtraArgsFlags(flags, &initOptions.externalcfg.APIServer.ExtraArgs, &initOptions.externalcfg.ControllerManager.ExtraArgs, &initOptions.externalcfg.Scheduler.ExtraArgs)
@@ -174,11 +178,10 @@ func NewCmdInit(out io.Writer) *cobra.Command {
 	initRunner.AppendPhase(phases.NewMarkControlPlanePhase())
 	initRunner.AppendPhase(phases.NewBootstrapTokenPhase())
 	initRunner.AppendPhase(phases.NewAddonPhase())
-	// TODO: add other phases to the runner.
 
 	// sets the data builder function, that will be used by the runner
 	// both when running the entire workflow or single phases
-	initRunner.SetDataInitializer(func() (workflow.RunData, error) {
+	initRunner.SetDataInitializer(func(cmd *cobra.Command) (workflow.RunData, error) {
 		return newInitData(cmd, initOptions, out)
 	})
 
@@ -193,7 +196,7 @@ func NewCmdInit(out io.Writer) *cobra.Command {
 func AddInitConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1beta1.InitConfiguration, featureGatesString *string) {
 	flagSet.StringVar(
 		&cfg.LocalAPIEndpoint.AdvertiseAddress, options.APIServerAdvertiseAddress, cfg.LocalAPIEndpoint.AdvertiseAddress,
-		"The IP address the API Server will advertise it's listening on. Specify '0.0.0.0' to use the address of the default network interface.",
+		"The IP address the API Server will advertise it's listening on. If not set the default network interface will be used.",
 	)
 	flagSet.Int32Var(
 		&cfg.LocalAPIEndpoint.BindPort, options.APIServerBindPort, cfg.LocalAPIEndpoint.BindPort,
@@ -227,10 +230,7 @@ func AddInitConfigFlags(flagSet *flag.FlagSet, cfg *kubeadmapiv1beta1.InitConfig
 		&cfg.NodeRegistration.Name, options.NodeName, cfg.NodeRegistration.Name,
 		`Specify the node name.`,
 	)
-	flagSet.StringVar(
-		&cfg.NodeRegistration.CRISocket, options.NodeCRISocket, cfg.NodeRegistration.CRISocket,
-		`Specify the CRI socket to connect to.`,
-	)
+	cmdutil.AddCRISocketFlag(flagSet, &cfg.NodeRegistration.CRISocket)
 	flagSet.StringVar(featureGatesString, options.FeatureGatesString, *featureGatesString, "A set of key=value pairs that describe feature gates for various features. "+
 		"Options are:\n"+strings.Join(features.KnownFeatures(&features.InitFeatureGates), "\n"))
 }
@@ -290,7 +290,9 @@ func newInitData(cmd *cobra.Command, options *initOptions, out io.Writer) (initD
 	}
 
 	ignorePreflightErrorsSet, err := validation.ValidateIgnorePreflightErrors(options.ignorePreflightErrors)
-	kubeadmutil.CheckErr(err)
+	if err != nil {
+		return initData{}, err
+	}
 
 	if err = validation.ValidateMixedArguments(cmd.Flags()); err != nil {
 		return initData{}, err
@@ -306,6 +308,15 @@ func newInitData(cmd *cobra.Command, options *initOptions, out io.Writer) (initD
 	if err != nil {
 		return initData{}, err
 	}
+
+	// override node name and CRI socket from the command line options
+	if options.externalcfg.NodeRegistration.Name != "" {
+		cfg.NodeRegistration.Name = options.externalcfg.NodeRegistration.Name
+	}
+	if options.externalcfg.NodeRegistration.CRISocket != "" {
+		cfg.NodeRegistration.CRISocket = options.externalcfg.NodeRegistration.CRISocket
+	}
+
 	if err := configutil.VerifyAPIServerBindAddress(cfg.LocalAPIEndpoint.AdvertiseAddress); err != nil {
 		return initData{}, err
 	}

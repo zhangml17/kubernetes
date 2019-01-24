@@ -17,11 +17,14 @@ limitations under the License.
 package phases
 
 import (
-	"errors"
 	"fmt"
+
+	"github.com/pkg/errors"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
+	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
 	"k8s.io/kubernetes/pkg/util/normalizer"
@@ -69,16 +72,21 @@ func getPhaseDescription(component string) string {
 // NewControlPlanePhase creates a kubeadm workflow phase that implements bootstrapping the control plane.
 func NewControlPlanePhase() workflow.Phase {
 	phase := workflow.Phase{
-		Name:    "control-plane",
-		Short:   "Generates all static Pod manifest files necessary to establish the control plane",
-		Example: controlPlaneExample,
+		Name:  "control-plane",
+		Short: "Generates all static Pod manifest files necessary to establish the control plane",
+		Long:  cmdutil.MacroCommandLongDescription,
 		Phases: []workflow.Phase{
+			{
+				Name:           "all",
+				Short:          "Generates all static Pod manifest files",
+				InheritFlags:   getControlPlanePhaseFlags("all"),
+				RunAllSiblings: true,
+			},
 			newControlPlaneSubPhase(kubeadmconstants.KubeAPIServer),
 			newControlPlaneSubPhase(kubeadmconstants.KubeControllerManager),
 			newControlPlaneSubPhase(kubeadmconstants.KubeScheduler),
 		},
-		Run:          runControlPlanePhase,
-		InheritFlags: getControlPlanePhaseFlags("all"),
+		Run: runControlPlanePhase,
 	}
 	return phase
 }
@@ -98,6 +106,7 @@ func getControlPlanePhaseFlags(name string) []string {
 		options.CfgPath,
 		options.CertificatesDir,
 		options.KubernetesVersion,
+		options.ImageRepository,
 	}
 	if name == "all" || name == kubeadmconstants.KubeAPIServer {
 		flags = append(flags,
@@ -141,9 +150,6 @@ func runControlPlaneSubPhase(component string) func(c workflow.RunData) error {
 		cfg := data.Cfg()
 
 		fmt.Printf("[control-plane] Creating static Pod manifest for %q\n", component)
-		if err := controlplane.CreateStaticPodFiles(data.ManifestDir(), cfg, component); err != nil {
-			return err
-		}
-		return nil
+		return controlplane.CreateStaticPodFiles(data.ManifestDir(), cfg, component)
 	}
 }
